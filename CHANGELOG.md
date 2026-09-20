@@ -7,6 +7,12 @@ See [`RELEASE.md`](RELEASE.md) for publication and verification procedures.
 
 ## [Unreleased]
 
+- Computer Use selects signed tool schemas supported by the connected Host,
+  retaining an explicit compatibility baseline across Host/catalogue update
+  order. Desktop advertises generic Host descriptors; concurrent Genies retain
+  separate selections and a Host replacement cannot silently change an admitted
+  operation. New native decision features wait for compatible components.
+
 - Routine native Computer Use can delegate control selection to an available
   decision model through the existing observation tool. Fresh controls and exact
   supplied arguments become compact choices; ordinary action admission, human
