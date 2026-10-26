@@ -26,7 +26,7 @@ const content = "Synthetic source";
 const fingerprint = createHash("sha256").update(JSON.stringify([origin.provider, origin.origin, origin.providerAgentId,
   origin.chatId, origin.threadRootId, origin.messageId, origin.senderId, origin.senderType, origin.createdAt, content])).digest("hex");
 const receipt = { id: receiptId, userId: owner, bindingId, bindingRevision: 0, connectionGeneration: 1,
-  sessionMessageId: 17, turnId: input.reference.turnId, jobId, state: "accepted", fingerprint,
+  sessionMessageId: 17, controlInput: null, turnId: input.reference.turnId, jobId, state: "accepted", fingerprint,
   providerMessageId: origin.messageId, externalSenderId: origin.senderId };
 const job = { id: jobId, ownerId: owner, requestorId: owner, input: input.reference, status: "queued", startedAt: null, completedAt: null };
 const acceptance = { id: acceptanceId, kind: "foreground", status: "dispatched", jobId, dispatchedAt: now, cancelledAt: null };
@@ -42,7 +42,7 @@ function db(steps: Step[], mode = "plaintext_only") {
       expect(step?.table).toBe(call.table); expect(step?.op ?? "select").toBe(op); return step?.rows ?? [];
     };
     const chain = { from(t: unknown) { call.table = getTableName(t as never); return chain; },
-      innerJoin() { return chain; }, where(v: SQL) { call.predicate = v; return chain; }, orderBy() { return chain; },
+      innerJoin() { return chain; }, leftJoin() { return chain; }, groupBy() { return chain; }, where(v: SQL) { call.predicate = v; return chain; }, orderBy() { return chain; },
       values(v: unknown) { call.values = v; return chain; }, set(v: unknown) { call.values = v; return chain; },
       for() { return Promise.resolve(read()); }, limit() { return Promise.resolve(read()); }, returning() { return Promise.resolve(read()); },
       then(resolve: (rows: unknown[]) => unknown) { return Promise.resolve(read()).then(resolve); } };
@@ -69,7 +69,7 @@ const publicationContext = { userId: owner, connectionId, connectionGeneration: 
 const publicationClaim = { outboxId: uuid(11), claimToken: uuid(12) };
 const finalContent = "Synthetic final response";
 const finalFingerprint = createHash("sha256").update(JSON.stringify(["external-room-final-v1", receiptId, jobId, finalContent])).digest("hex");
-const outbox = { id: publicationClaim.outboxId, sourceInboxId: receiptId, explicitShareId: null, sessionMessageId: 18, fingerprint: finalFingerprint };
+const outbox = { id: publicationClaim.outboxId, sourceInboxId: receiptId, explicitShareId: null, sessionMessageId: 18, controlResult: null, fingerprint: finalFingerprint };
 const publicationSteps = (): Step[] => [
   { table: "bolter_connections", rows: [connection] }, { table: "bolter_room_bindings", rows: [binding] },
   { table: "bolter_outbox", rows: [outbox] }, { table: "bolter_inbox_receipts", rows: [{ jobId, input: input.reference }] },
@@ -203,4 +203,47 @@ describe("Bolter exact durable execution", () => {
       "m.reply_to_message_id = i.session_message_id", "m.fingerprint = NEW.fingerprint", "btrim(m.content) <> ''", "NEW.explicit_share_id IS NOT NULL"]) expect(result).toContain(condition);
     expect(result).not.toContain("SECURITY DEFINER"); expect(result).not.toContain("GRANT ALL");
   });
+});
+
+test("explicit file publication requires fingerprinted metadata and retained blobs in the exact Room namespace", async () => {
+  const { bolterReviewedTextFingerprint } = await import("../../src/queries/bolter-bridge");
+  const file = { id: uuid(44), filename: "brief.txt", mimeType: "text/plain", sizeBytes: 5, sha256: "a".repeat(64) };
+  const requestId = uuid(45), shareId = uuid(46), content = "Synthetic shared file";
+  const fingerprint = bolterReviewedTextFingerprint(bindingId, requestId, content, [file]);
+  const shared = { ...outbox, sourceInboxId: null, explicitShareId: shareId, fingerprint };
+  const share = { id: shareId, requestId, sessionMessageId: outbox.sessionMessageId, fingerprint };
+  function steps(missing = false, altered = false): Step[] {
+    return [
+      { table: "bolter_connections", rows: [connection] }, { table: "bolter_room_bindings", rows: [binding] },
+      { table: "bolter_outbox", rows: [shared] }, { table: "bolter_explicit_shares", rows: [share] },
+      { table: "bolter_outbox", rows: [shared] }, { table: "session_messages", rows: [{ content, fingerprint,
+        metadata: { bolterAttachments: [{ ...file, filename: altered ? "different.txt" : file.filename }] } }] },
+      { table: "message_attachments", rows: missing ? [] : [{ ...file, storageUri: "file:///path/to/synthetic/blob" }] },
+    ];
+  }
+  const f = db(steps());
+  const result = await loadBolterPublicationContentWith(f.database, publicationContext, publicationClaim);
+  expect(result?.files).toEqual([{ ...file, storageUri: "file:///path/to/synthetic/blob" }]);
+  const predicate = new PgDialect().sqlToQuery(f.calls.at(-1)!.predicate!);
+  expect(predicate.params).toContain(binding.namespaceId);
+  expect(predicate.params).toContain("retained");
+  expect(predicate.params).toContain(fingerprint);
+  expect(await loadBolterPublicationContentWith(db(steps(true)).database, publicationContext, publicationClaim)).toBeNull();
+  const altered = db(steps(false, true));
+  expect(await loadBolterPublicationContentWith(altered.database, publicationContext, publicationClaim)).toBeNull();
+  expect(altered.calls.some(call => call.table === "message_attachments")).toBe(false);
+});
+
+test("automatic delivery reads use exact IDs and aggregate only unresolved states", async () => {
+  const { getBolterDeliveryCountsWith, listBolterDeliverySummariesWith } = await import("../../src/queries/bolter-bridge");
+  const counts = db([{ table: "bolter_outbox", rows: [{ state: "pending", quantity: 2 }, { state: "publishing", quantity: 1 }, { state: "uncertain", quantity: 4 }] }]);
+  expect(await getBolterDeliveryCountsWith(counts.database, { userId: owner }, bindingId)).toEqual({ pending: 3, uncertain: 4 });
+  const countQuery = new PgDialect().sqlToQuery(counts.calls[0]!.predicate!);
+  for (const param of [owner, bindingId, "pending", "publishing", "uncertain"]) expect(countQuery.params).toContain(param);
+  for (const selection of [{ outboxId: publicationClaim.outboxId }, { requestId: uuid(50) }]) {
+    const exact = db([{ table: "bolter_outbox", rows: [] }]);
+    await listBolterDeliverySummariesWith(exact.database, { userId: owner }, bindingId, selection);
+    const predicate = new PgDialect().sqlToQuery(exact.calls[0]!.predicate!);
+    for (const param of [owner, bindingId, Object.values(selection)[0]]) expect(predicate.params).toContain(param);
+  }
 });

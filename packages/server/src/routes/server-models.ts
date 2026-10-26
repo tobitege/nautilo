@@ -7,7 +7,7 @@ import {
   getEligibleModels,
   getProtectedMemoryEmbeddingConfiguration,
   getServerSpeechModel,
-  hasRunnableOpenRouterTransport,
+  hydrateSurplusChatCatalog,
   kickRuntimeModelCatalogRefresh,
   listMediaGenerationModels,
   listResolvedCatalogModels,
@@ -20,6 +20,7 @@ import {
   resolveQualifiedSurplusChatRoute,
   resolveServerFundedForegroundCatalogModel,
   resolveSurplusChatServingAvailability,
+  resolveSurplusDecisionServingAvailability,
   type QualifiedSurplusChatRoute,
 } from "@nautilo/agent";
 import { candidatesForModelRole } from "@nautilo/config";
@@ -49,14 +50,37 @@ function catalogModels(input?: {
   readonly routes?: readonly QualifiedSurplusChatRoute[];
 }) {
   kickRuntimeModelCatalogRefresh();
+  const surplusMediaIds = input
+    ? new Set(([
+        ...listMediaGenerationModels("image", process.env, input),
+        ...listMediaGenerationModels("music", process.env, input),
+        ...listMediaGenerationModels("video", process.env, input),
+      ]).filter((model) => model.enabled).map((model) => model.id))
+    : new Set<string>();
   return listResolvedCatalogModels({ includeUnavailable: true }).map((directModel) => {
-    const model = input
+    let model = input
       ? resolveServerFundedForegroundCatalogModel(directModel.id, {
           policyEnabled: input.policyEnabled,
           keyConfigured: input.keyConfigured,
           ...(input.routes === undefined ? {} : { routes: input.routes }),
         })
       : directModel;
+    if (input && directModel.availability === "missing_credentials"
+      && model.availability === "missing_credentials") {
+      const decision = directModel.workload === "decision"
+        ? resolveSurplusDecisionServingAvailability({
+            catalogModelId: directModel.id,
+            policyEnabled: input.policyEnabled,
+            keyConfigured: input.keyConfigured,
+            fundingKind: "server",
+          })
+        : null;
+      if (decision?.status === "available" || surplusMediaIds.has(directModel.id)) {
+        const selectable = { ...model, availability: "selectable" as const };
+        delete selectable.unavailableReason;
+        model = selectable;
+      }
+    }
     return ({
       id: model.id,
       displayName: model.displayName,
@@ -86,10 +110,13 @@ function embeddingModels() {
     const provider = id.split(":")[0] as "venice" | "openrouter" | "openai";
     const label = provider === "venice" ? "Venice" : provider === "openrouter" ? "OpenRouter" : "OpenAI";
     const modelId = id.slice(id.indexOf(":") + 1);
-    return { id, displayName: `${label} — ${modelId} (1,536 dimensions)`,
-      available: provider === "openrouter"
-        ? hasRunnableOpenRouterTransport()
-        : resolveProviderKey(provider) !== null };
+    let available = false;
+    try {
+      available = getProtectedMemoryEmbeddingConfiguration(id).dimensions === 1536;
+    } catch (error) {
+      if (!(error instanceof EmbeddingProviderError)) throw error;
+    }
+    return { id, displayName: `${label} — ${modelId} (1,536 dimensions)`, available };
   });
 }
 
@@ -105,8 +132,11 @@ function effectiveEmbeddingModel(): string | null {
 
 type MediaGenerationModelKind = "image" | "music" | "video";
 
-function mediaGenerationModels(kind: MediaGenerationModelKind) {
-  return listMediaGenerationModels(kind).map((model) => ({
+function mediaGenerationModels(
+  kind: MediaGenerationModelKind,
+  surplusInput?: { readonly policyEnabled: boolean; readonly keyConfigured: boolean },
+) {
+  return listMediaGenerationModels(kind, process.env, surplusInput).map((model) => ({
     id: model.id,
     displayName: model.displayName,
     provider: model.provider,
@@ -270,7 +300,7 @@ function parseUpdateBody(
     }
     const id = value?.trim() ?? null;
     if (id) {
-      const option = listMediaModels(kind).find((entry) => entry.id === id);
+      const option = listMediaModels(kind, surplusInput).find((entry) => entry.id === id);
       if (!option) {
         return { ok: false, error: `Unsupported ${kind} generation model` };
       }
@@ -318,7 +348,7 @@ function parseUpdateBody(
     if (typeof v !== "string") return { ok: false, error: "conductorModel must be a string" };
     // Empty string ⇒ inherit the default chat model (stored as null).
     if (v.trim() !== "") {
-      const reason = unavailableReason(v, "chat", false);
+      const reason = unavailableReason(v, "chat", true);
       if (reason && v !== retained?.conductorModel) return { ok: false, error: `model unavailable: ${v} (${reason})` };
     }
     patch.conductorModel = v.trim() === "" ? null : v;
@@ -330,7 +360,7 @@ function parseUpdateBody(
       return { ok: false, error: "stenographerModel must be a string" };
     }
     if (v.trim() !== "") {
-      const reason = unavailableReason(v, "chat", false);
+      const reason = unavailableReason(v, "chat", true);
       if (reason && v !== retained?.stenographerModel) return { ok: false, error: `model unavailable: ${v} (${reason})` };
     }
     patch.stenographerModel = v.trim() === "" ? null : v;
@@ -342,7 +372,7 @@ function parseUpdateBody(
       return { ok: false, error: "reflectionModel must be a string" };
     }
     if (v.trim() !== "") {
-      const reason = unavailableReason(v, "chat", false);
+      const reason = unavailableReason(v, "chat", true);
       if (reason && v !== retained?.reflectionModel) return { ok: false, error: `model unavailable: ${v} (${reason})` };
     }
     patch.reflectionModel = v.trim() === "" ? null : v;
@@ -354,7 +384,7 @@ function parseUpdateBody(
       return { ok: false, error: "memoryReviewModel must be a string or null" };
     }
     if (value?.trim()) {
-      const reason = unavailableReason(value, "chat-tools", false);
+      const reason = unavailableReason(value, "chat-tools", true);
       if (reason && value !== retained?.memoryReviewModel) return { ok: false, error: `model unavailable: ${value} (${reason})` };
     }
     patch.memoryReviewModel = value?.trim() ? value : null;
@@ -515,6 +545,7 @@ export interface ServerModelsRouteDeps {
   getEffectiveMediaModel?: typeof effectiveMediaGenerationModel;
   getEffectiveSpeechModel?: () => string | null;
   getSurplusKeyConfigured?: () => boolean;
+  hydrateSurplusChatCatalog?: typeof hydrateSurplusChatCatalog;
   /** Pure offline seam; production derives routes from the signed catalogue. */
   getQualifiedSurplusChatRoutes?: () => readonly QualifiedSurplusChatRoute[];
 }
@@ -535,10 +566,21 @@ export function serverModelsRoutes(
   const listMediaModels = overrides.listMediaModels ?? mediaGenerationModels;
   const listVisionModels = overrides.listImageUnderstandingModels ?? imageUnderstandingModels;
   const getEffectiveMediaModel = overrides.getEffectiveMediaModel ?? effectiveMediaGenerationModel;
+  const getSurplusKeyConfigured = overrides.getSurplusKeyConfigured
+    ?? (() => resolveProviderKey("surplus") !== null);
+  const getQualifiedSurplusChatRoutes = overrides.getQualifiedSurplusChatRoutes;
+  const hydrateSurplusProjection = async (policyEnabled: boolean, keyConfigured: boolean) => {
+    if (!policyEnabled || !keyConfigured || getQualifiedSurplusChatRoutes) return;
+    try {
+      await (overrides.hydrateSurplusChatCatalog ?? hydrateSurplusChatCatalog)();
+    } catch {
+      // Keep administration reachable; the sync projection remains fail-closed
+      // on the last verified discovery snapshot.
+    }
+  };
   const wire = (config: ResolvedServerModelConfig) => {
-    const keyConfigured = (overrides.getSurplusKeyConfigured
-      ?? (() => resolveProviderKey("surplus") !== null))();
-    const routes = overrides.getQualifiedSurplusChatRoutes?.();
+    const keyConfigured = getSurplusKeyConfigured();
+    const routes = getQualifiedSurplusChatRoutes?.();
     const surplus = resolveSurplusChatServingAvailability({
       policyEnabled: config.preferSurplus,
       keyConfigured,
@@ -565,9 +607,9 @@ export function serverModelsRoutes(
       effectiveImageUnderstandingModel: config.imageUnderstandingModel
         ? visionModels.find((model) => model.id === config.imageUnderstandingModel && model.available)?.id ?? null
         : visionModels.find((model) => model.available)?.id ?? null,
-      imageModels: listMediaModels("image"),
-      musicModels: listMediaModels("music"),
-      videoModels: listMediaModels("video"),
+      imageModels: listMediaModels("image", visionProjection),
+      musicModels: listMediaModels("music", visionProjection),
+      videoModels: listMediaModels("video", visionProjection),
       speechModels: listSpeechModels().map(({ speech, providerModelId, ...model }) => model),
       effectiveSpeechModel: (overrides.getEffectiveSpeechModel ?? (() => { try { return getServerSpeechModel().id; } catch { return null; } }))(),
       effectiveImageModel: getEffectiveMediaModel("image"),
@@ -582,10 +624,15 @@ export function serverModelsRoutes(
     if (!(await viewerHasCapability(userId, "read_server_settings", getCapabilities))) {
       return reply.code(403).send({ error: "admin only" });
     }
+    await hydrateSurplusProjection(
+      getCachedServerModelConfigRow()?.preferSurplus === true,
+      getSurplusKeyConfigured(),
+    );
     const config = await getConfig(getDb(), getDefaults());
     // Retry reconciliation on reload; report the actual runtime snapshot even
     // when refresh retains stale state after a database failure.
     await refreshConfigCache(true);
+    await hydrateSurplusProjection(config.preferSurplus, getSurplusKeyConfigured());
     return reply.send(wire(config));
   });
 
@@ -597,14 +644,21 @@ export function serverModelsRoutes(
     }
 
     const db = getDb();
+    const bodyPolicy = (request.body as Record<string, unknown> | null)?.["preferSurplus"];
+    await hydrateSurplusProjection(
+      typeof bodyPolicy === "boolean"
+        ? bodyPolicy
+        : getCachedServerModelConfigRow()?.preferSurplus === true,
+      getSurplusKeyConfigured(),
+    );
     const defaults = getDefaults();
     const before = await getConfig(db, defaults);
     const requestedPolicy = typeof (request.body as Record<string, unknown> | null)?.["preferSurplus"] === "boolean"
       ? (request.body as Record<string, boolean>)["preferSurplus"]!
       : before.preferSurplus;
-    const keyConfigured = (overrides.getSurplusKeyConfigured
-      ?? (() => resolveProviderKey("surplus") !== null))();
-    const routes = overrides.getQualifiedSurplusChatRoutes?.();
+    const keyConfigured = getSurplusKeyConfigured();
+    const routes = getQualifiedSurplusChatRoutes?.();
+    await hydrateSurplusProjection(requestedPolicy, keyConfigured);
     const parsed = parseUpdateBody(request.body, listMediaModels, {
       policyEnabled: requestedPolicy,
       keyConfigured,

@@ -3,12 +3,12 @@
  * this suite replaces them with content-free receipts and must not leak those
  * module mocks into the shared unit-test process.
  */
-import { AIMessage, HumanMessage } from "@langchain/core/messages";
+import { AIMessage, AIMessageChunk, HumanMessage } from "@langchain/core/messages";
 import { beforeEach, describe, expect, mock, test } from "bun:test";
 
 const createModelInputs: Record<string, unknown>[] = [];
 const bindTools = mock((_tools: unknown[], _options?: Record<string, unknown>) => ({ invoke: async () => new AIMessage("unused") }));
-let observedResponse: ((receipt: { requestId: string; providerFamily: string; truncated: boolean; adaptedParameters?: string; buyerCostMicro?: number }, status: number) => Promise<void>) | undefined;
+let observedResponse: ((receipt: { requestId: string; providerFamily?: string; marketplaceAttempts?: number; truncated: boolean; adaptedParameters?: string; buyerCostMicro?: number }, status: number) => Promise<void>) | undefined;
 const beginAttempt = mock(async (_input: Record<string, unknown>) => {});
 const settleAttempt = mock(async (_input: Record<string, unknown>) => {});
 
@@ -26,7 +26,13 @@ mock.module("../../src/providers/surplus-transport", () => ({
     observedResponse = input["onResponse"] as typeof observedResponse;
     return { invoke: async () => new AIMessage("unused"), bindTools };
   },
-  isSafeSurplusDirectFallback: () => false,
+  isSafeSurplusDirectFallback: (
+    error: { code?: string } | undefined,
+    status: number | undefined,
+    receipt: { marketplaceAttempts?: number } | undefined,
+    visibleOutput: boolean,
+  ) => !visibleOutput && status === 404 && error?.code === "no_sellers_for_model"
+    && receipt?.marketplaceAttempts === 0,
   SurplusOutcomeUnknownError: MockSurplusOutcomeUnknownError,
 }));
 
@@ -36,9 +42,11 @@ const {
   surplusReasoningModelKwargs,
 } = await import("../../src/providers/factory");
 const {
+  assertCompleteSurplusResponse,
   canUseQualifiedSurplusChatRoute,
   invokeSurplusChatAttempt,
 } = await import("../../src/providers/surplus-attempt");
+const { SurplusMarketplaceAttemptError } = await import("../../src/providers/surplus-error");
 const { runWithUsageContext } = await import("../../src/usage/usage-context");
 
 const MODEL_ID = "openrouter:openai/gpt-5.6-sol";
@@ -62,6 +70,22 @@ beforeEach(() => {
 });
 
 describe("Surplus reasoning parity", () => {
+  test("requires an actual AI message even when a generic value carries terminal text", () => {
+    const receipt = { truncated: false };
+    for (const generic of [
+      null,
+      undefined,
+      { content: "plausible text", response_metadata: { finish_reason: "stop" } },
+      new HumanMessage({ content: "plausible text" }),
+    ]) {
+      expect(() => assertCompleteSurplusResponse(receipt, generic)).toThrow();
+    }
+    expect(() => assertCompleteSurplusResponse(receipt, new AIMessageChunk({
+      content: "real streamed text",
+      response_metadata: { finish_reason: "stop" },
+    }))).not.toThrow();
+  });
+
   test("forwards only trimmed opaque UUID session state", () => {
     expect(openRouterSessionModelKwargs(
       " 22222222-2222-4222-8222-222222222222 ",
@@ -384,7 +408,13 @@ describe("Surplus reasoning parity", () => {
       },
     });
 
-    expect(await attempt).toEqual({ kind: "direct_fallback" });
+    const result = await attempt;
+    expect(result).toMatchObject({
+      kind: "direct_fallback",
+      failure: { code: "surplus_marketplace_attempt_failed" },
+    });
+    if (result.kind !== "direct_fallback") throw new Error("expected direct fallback");
+    expect(result.failure).toBeInstanceOf(SurplusMarketplaceAttemptError);
     expect(inferenceCalls).toBe(1);
     expect(beginAttempt).toHaveBeenCalledTimes(1);
     expect(settleAttempt).toHaveBeenCalledTimes(2);
@@ -417,12 +447,139 @@ describe("Surplus reasoning parity", () => {
       },
     });
 
-    expect(result).toEqual({ kind: "direct_fallback" });
+    expect(result).toMatchObject({
+      kind: "direct_fallback",
+      failure: { code: "surplus_marketplace_attempt_failed" },
+    });
+    if (result.kind !== "direct_fallback") throw new Error("expected direct fallback");
+    expect(result.failure).toBeInstanceOf(SurplusMarketplaceAttemptError);
     expect(settleAttempt.mock.calls[0]?.[0]).toMatchObject({
       outcome: "unknown",
       costState: "actual",
       actualCostUsd: 0.000283,
       failureCode: "outcome_unknown",
+    });
+  });
+
+  test("marks only the original pinned no-seller refusal for one unpinned retry", async () => {
+    const run = async (options: {
+      providerMode?: "any";
+      status?: number;
+      code?: string;
+      marketplaceAttempts?: number;
+      deliveredOutput?: boolean;
+      cancelled?: boolean;
+    }) => {
+      const controller = new AbortController();
+      if (options.cancelled) controller.abort(new Error("cancelled"));
+      return invokeSurplusChatAttempt({
+        route: ROUTE,
+        apiKey: "synthetic-surplus-key",
+        ...(options.providerMode ? { providerMode: options.providerMode } : {}),
+        messages: [new HumanMessage("test")],
+        tools: [],
+        config: { signal: controller.signal },
+        maxOutputTokens: 256,
+        funding: { kind: "server", providerRoute: "surplus", humanUserId: "user-1" },
+        hasDeliveredOutput: () => options.deliveredOutput === true,
+        invokeModel: async () => {
+          if (options.status !== undefined) {
+            await observedResponse!({
+              requestId: "refusal-request",
+              ...(options.marketplaceAttempts === undefined
+                ? {}
+                : { marketplaceAttempts: options.marketplaceAttempts }),
+              truncated: false,
+            }, options.status);
+          }
+          throw Object.assign(new Error(options.code ?? "request failed"), { code: options.code });
+        },
+      });
+    };
+
+    expect(await run({ status: 404, code: "no_sellers_for_model", marketplaceAttempts: 0 }))
+      .toMatchObject({
+        kind: "direct_fallback",
+        retryUnpinned: true,
+        failure: {
+          code: "surplus_marketplace_attempt_failed",
+          vendorCode: "no_sellers_for_model",
+          status: 404,
+          traceId: "refusal-request",
+        },
+      });
+    expect(await run({ providerMode: "any", status: 404, code: "no_sellers_for_model", marketplaceAttempts: 0 }))
+      .toMatchObject({
+        kind: "direct_fallback",
+        failure: { code: "surplus_marketplace_attempt_failed", traceId: "refusal-request" },
+      });
+    expect(await run({ status: 404, code: "no_sellers_for_model", marketplaceAttempts: 1 }))
+      .toMatchObject({
+        kind: "direct_fallback",
+        failure: { code: "surplus_marketplace_attempt_failed", vendorCode: "no_sellers_for_model", status: 404 },
+      });
+    expect(await run({ status: 401, code: "invalid_api_key" }))
+      .toMatchObject({
+        kind: "direct_fallback",
+        failure: { code: "surplus_marketplace_attempt_failed", vendorCode: "invalid_api_key", status: 401 },
+      });
+    expect(await run({ code: "timeout" })).toMatchObject({
+      kind: "direct_fallback",
+      failure: { code: "surplus_marketplace_attempt_failed", vendorCode: "timeout" },
+    });
+    const delivered = await run({
+      status: 404,
+      code: "no_sellers_for_model",
+      marketplaceAttempts: 0,
+      deliveredOutput: true,
+    }).catch((error: unknown) => error);
+    expect(delivered).toBeInstanceOf(MockSurplusOutcomeUnknownError);
+    const cancelled = await run({
+      status: 404,
+      code: "no_sellers_for_model",
+      marketplaceAttempts: 0,
+      cancelled: true,
+    }).catch((error: unknown) => error);
+    expect(cancelled).toBeInstanceOf(Error);
+    expect((cancelled as Error).message).toBe("cancelled");
+  });
+
+  test("records unpinned attempts separately with their original catalogue binding", async () => {
+    const response = new AIMessage({ content: "ok", response_metadata: { finish_reason: "stop" } });
+    await invokeSurplusChatAttempt({
+      route: ROUTE,
+      apiKey: "synthetic-surplus-key",
+      providerMode: "any",
+      messages: [new HumanMessage("test")],
+      tools: [],
+      config: {},
+      maxOutputTokens: 256,
+      funding: { kind: "server", providerRoute: "surplus", humanUserId: "user-1" },
+      hasDeliveredOutput: () => false,
+      invokeModel: async () => {
+        await observedResponse!({
+          requestId: "unpinned-request",
+          providerFamily: "alternate-provider",
+          truncated: false,
+        }, 200);
+        return response;
+      },
+    });
+
+    expect(createModelInputs.at(-1)).toMatchObject({ providerMode: "any" });
+    expect(beginAttempt.mock.calls.at(-1)?.[0]).toMatchObject({
+      model: MODEL_ID,
+      provider: "openrouter",
+      metadata: {
+        catalogModelId: MODEL_ID,
+        surplusModelId: ROUTE.surplusModelId,
+        surplusProviderPin: ROUTE.providerPin,
+        surplusUnpinnedModel: true,
+      },
+    });
+    expect(settleAttempt.mock.calls.at(-1)?.[0]).toMatchObject({
+      providerRequestId: "unpinned-request",
+      servingProvider: "alternate-provider",
     });
   });
 
@@ -480,4 +637,69 @@ test("personal marketplace attempts retain exact credential provenance and actua
     credentialId: funding.credentialId, credentialRevision: 9, userId: "personal-human" });
   expect(settleAttempt.mock.calls.at(-1)?.[0]).toMatchObject({ outcome: "succeeded", costState: "actual", actualCostUsd: 0.000047 });
   expect(JSON.stringify(beginAttempt.mock.calls.at(-1))).not.toContain("personal-surplus-only");
+});
+
+describe("strict service fallback policy", () => {
+  test("keeps a charged uncertain attempt unresolved instead of admitting direct replay", async () => {
+    await Promise.resolve(expect(invokeSurplusChatAttempt({
+      route: ROUTE, apiKey: "synthetic-service-key", messages: [new HumanMessage("Synthetic Soul")],
+      tools: [], config: {}, maxOutputTokens: 256,
+      funding: { kind: "service", providerRoute: "surplus", humanUserId: "user-1" },
+      directFallbackPolicy: "pre_service_only", hasDeliveredOutput: () => false,
+      invokeModel: async () => {
+        await observedResponse!({ requestId: "uncertain-soul", providerFamily: "openrouter",
+          buyerCostMicro: 17, truncated: false }, 200);
+        throw new Error("synthetic connection loss");
+      },
+    })).rejects.toBeInstanceOf(MockSurplusOutcomeUnknownError));
+    expect(beginAttempt).toHaveBeenCalledTimes(1);
+    expect(settleAttempt).toHaveBeenCalledTimes(1);
+    expect(settleAttempt.mock.calls[0]?.[0]).toMatchObject({
+      outcome: "unknown", costState: "actual", actualCostUsd: 0.000017,
+    });
+  });
+
+  test("retains same-model direct eligibility after a proven zero-attempt refusal", async () => {
+    const result = await invokeSurplusChatAttempt({
+      route: ROUTE, apiKey: "synthetic-service-key", messages: [new HumanMessage("Synthetic Soul")],
+      tools: [], config: {}, maxOutputTokens: 256,
+      funding: { kind: "service", providerRoute: "surplus", humanUserId: "user-1" },
+      directFallbackPolicy: "pre_service_only", hasDeliveredOutput: () => false,
+      invokeModel: async () => {
+        await observedResponse!({ requestId: "refused-soul", marketplaceAttempts: 0, truncated: false }, 404);
+        throw Object.assign(new Error("Synthetic no-seller refusal"), { code: "no_sellers_for_model" });
+      },
+    });
+    expect(result).toMatchObject({
+      kind: "direct_fallback",
+      retryUnpinned: true,
+      modelUnavailableBeforeService: true,
+      failure: {
+        code: "surplus_marketplace_attempt_failed",
+        vendorCode: "no_sellers_for_model",
+        status: 404,
+        traceId: "refused-soul",
+      },
+    });
+    expect(settleAttempt.mock.calls[0]?.[0]).toMatchObject({
+      outcome: "failed", costState: "actual", actualCostUsd: 0, failureCode: "no_sellers_for_model",
+    });
+    expect(settleAttempt.mock.calls[0]?.[0]).not.toHaveProperty("providerRequestId");
+  });
+
+  test("does not admit direct replay for an incomplete successful envelope", async () => {
+    await Promise.resolve(expect(invokeSurplusChatAttempt({
+      route: ROUTE, apiKey: "synthetic-service-key", messages: [new HumanMessage("Synthetic Soul")],
+      tools: [], config: {}, maxOutputTokens: 256,
+      funding: { kind: "service", providerRoute: "surplus", humanUserId: "user-1" },
+      directFallbackPolicy: "pre_service_only", hasDeliveredOutput: () => false,
+      invokeModel: async () => {
+        await observedResponse!({ requestId: "incomplete-soul", providerFamily: "openrouter", truncated: false }, 200);
+        return new AIMessage("Soul without terminal metadata");
+      },
+    })).rejects.toBeInstanceOf(MockSurplusOutcomeUnknownError));
+    expect(settleAttempt.mock.calls[0]?.[0]).toMatchObject({
+      outcome: "interrupted", costState: "pending", failureCode: "incomplete_response",
+    });
+  });
 });
