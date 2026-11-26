@@ -20,12 +20,16 @@ export function normalizeGatewayBaseUrl(value: unknown): string | undefined {
 /**
  * The destination a gateway bearer key may be checked against or bound to:
  * the normalized base URL, refused when it embeds credentials, a query, or a
- * fragment, so a key is only ever sent to a plain base path.
+ * fragment, so a key is only ever sent to a plain base path. A bare `?` or
+ * `#` is refused as well: the URL parser reports it as an empty query or
+ * fragment, yet a path appended to such a base would land behind the
+ * delimiter and the request would go to the base path itself.
  */
 export function gatewayKeyDestination(value: unknown): string | null {
   const normalized = normalizeGatewayBaseUrl(value);
   if (!normalized) return null;
+  if (/[?#]/.test(normalized)) return null;
   const url = new URL(normalized);
-  if (url.username || url.password || url.search || url.hash) return null;
+  if (url.username || url.password) return null;
   return normalized;
 }

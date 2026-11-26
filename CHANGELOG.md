@@ -7,6 +7,12 @@ See [`RELEASE.md`](RELEASE.md) for publication and verification procedures.
 
 ## [Unreleased]
 
+- `nautilo setup` and other configuration writes check an OpenAI-compatible
+  gateway key against `GET <NAUTILO_GATEWAY_BASE_URL>/models` instead of
+  rejecting it as an unknown provider. A gateway that serves its model list
+  without authentication accepts any key. A base URL with a query or a
+  fragment, or one that ends in `?` or `#`, is refused.
+
 - Keep MindSwapper's request reference and recognized stream error reason
   when a response fails, so the failed attempt can be traced from Costs.
 

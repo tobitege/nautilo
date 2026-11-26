@@ -192,6 +192,10 @@ describe("health-checker", () => {
       "https://user:pass@gateway.example.test/v1",
       "https://gateway.example.test/v1?token=x",
       "https://gateway.example.test/v1#frag",
+      // A bare delimiter would turn the appended "/models" into a query or
+      // fragment and send the key to the base path instead.
+      "https://gateway.example.test/v1?",
+      "https://gateway.example.test/v1#",
     ]) {
       const env = baseUrl === undefined ? {} : { NAUTILO_GATEWAY_BASE_URL: baseUrl };
       const result = await checkProviderHealth("gateway", "synthetic-gateway-key", env);

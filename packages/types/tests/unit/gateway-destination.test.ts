@@ -23,4 +23,19 @@ describe("gateway destination", () => {
       expect(gatewayKeyDestination(value)).toBeNull();
     }
   });
+
+  test("a key destination refuses a bare query or fragment delimiter", () => {
+    // The parser reports an empty query and fragment for these, but appending
+    // "/models" would leave the request path at /v1.
+    for (const value of [
+      "https://gateway.example.test/v1?",
+      "https://gateway.example.test/v1#",
+      "https://gateway.example.test/v1/?",
+      "https://gateway.example.test/v1/#",
+      "https://gateway.example.test/v1?#",
+    ]) {
+      expect(new URL(`${value}/models`).pathname).not.toEndWith("/models");
+      expect(gatewayKeyDestination(value)).toBeNull();
+    }
+  });
 });
